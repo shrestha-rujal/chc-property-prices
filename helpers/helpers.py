@@ -6,6 +6,8 @@ from shapely.geometry import Point, LineString, MultiLineString
 import time
 import os
 
+# isodistance calculation
+
 
 def process_chunk(df_chunk, crs, G, G_base, max_dist, buffer_dist):
     pid = os.getpid()
@@ -79,7 +81,6 @@ def isodistance_from_access_point(property_row, property_crs, G, G_base, max_dis
     access_pt_proj = gpd.GeoSeries(
         [access_pt], crs=property_crs).to_crs("EPSG:2193").iloc[0]
 
-    # Find nearest edge efficiently using spatial index (front street)
     u, v, k = ox.distance.nearest_edges(
         G, access_pt_proj.x, access_pt_proj.y, return_dist=False)
 
@@ -88,7 +89,6 @@ def isodistance_from_access_point(property_row, property_crs, G, G_base, max_dis
     if 'geometry' in data:
         edge_geom = data['geometry']
     else:
-        # Create geometry from node coordinates
         u_pt = Point(G.nodes[u]['x'], G.nodes[u]['y'])
         v_pt = Point(G.nodes[v]['x'], G.nodes[v]['y'])
         edge_geom = LineString([u_pt, v_pt])
@@ -206,3 +206,93 @@ def isodistance_from_access_point(property_row, property_crs, G, G_base, max_dis
 
     result = MultiLineString(lines)
     return gpd.GeoSeries([result], crs=G.graph['crs']).to_crs(property_crs).iloc[0]
+
+
+# canopy calculation
+
+def calculate_canopy_for_all_reaches(property_row, canopy_gdf, canopy_sindex, reaches, buffer_dist=10):
+    results = {}
+
+    for dist in reaches:
+        reach_col = f'reach_{dist}m'
+        buffer_col = f'reach_buffer_{dist}m'
+        canopy_col = f'canopy_{dist}m'
+
+        reach = property_row.get(reach_col)
+
+        if reach is None or reach.is_empty:
+            results[buffer_col] = None
+            results[canopy_col] = 0.0
+            continue
+
+        reach_buffer = reach.buffer(buffer_dist)
+
+        if reach_buffer.is_empty:
+            results[buffer_col] = reach_buffer
+            results[canopy_col] = 0.0
+            continue
+
+        results[buffer_col] = reach_buffer
+
+        possible_matches_idx = list(
+            canopy_sindex.intersection(reach_buffer.bounds))
+
+        if not possible_matches_idx:
+            results[canopy_col] = 0.0
+            continue
+
+        possible_matches = canopy_gdf.iloc[possible_matches_idx]
+
+        canopy_within = possible_matches[possible_matches.intersects(
+            reach_buffer)]
+
+        if len(canopy_within) == 0:
+            results[canopy_col] = 0.0
+            continue
+
+        canopy_clipped = canopy_within.geometry.intersection(reach_buffer)
+        canopy_area = canopy_clipped.area.sum()
+
+        results[canopy_col] = canopy_area
+
+    return results
+
+
+def process_canopy_chunk(
+    df_chunk,
+    canopy_gdf,
+    canopy_sindex,
+    reaches,
+    buffer_dist
+):
+    pid = os.getpid()
+    start = time.time()
+    out = []
+
+    for i, (idx, row) in enumerate(df_chunk.iterrows(), start=1):
+
+        if i % 20 == 0:
+            elapsed = time.time() - start
+            rate = i / elapsed if elapsed > 0 else 0
+            print(
+                f"[PID {pid}] {i}/{len(df_chunk)} rows | "
+                f"{elapsed:.1f}s elapsed | {rate:.2f} rows/s"
+            )
+
+        try:
+            results = calculate_canopy_for_all_reaches(
+                property_row=row,
+                canopy_gdf=canopy_gdf,
+                canopy_sindex=canopy_sindex,
+                reaches=reaches,
+                buffer_dist=buffer_dist
+            )
+        except Exception:
+            results = None
+
+        out.append((idx, results))
+
+    total = time.time() - start
+    print(f"[PID {pid}] chunk done in {total:.1f}s")
+
+    return out
